@@ -81,7 +81,7 @@ static void play_track(int track)
      * playing it; if it's a finished fanfare we leave it silent so the
      * caller's per-frame poll doesn't re-fire it. */
     if (track == s_currentTrack) {
-        if (wav_is_playing() || s_currentTrackIsFanfare) {
+        if (wav_is_playing() || s_paused || s_currentTrackIsFanfare) {
             return;
         }
     }
@@ -153,7 +153,9 @@ int GetLogicalCDTrack(void)
         return 0;
     }
 
-    if (wav_is_playing()) {
+    /* Paused is still "on this track": the race loop polls this every frame
+     * while the game is paused, and must not see the track as finished. */
+    if (wav_is_playing() || s_paused) {
         return s_currentTrack;
     }
 

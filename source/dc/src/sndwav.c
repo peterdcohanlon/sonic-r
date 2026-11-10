@@ -20,6 +20,7 @@
 
 #include "sndwav.h"
 #include "fileio.h"
+#include "snd_resume.h"
 
 #define STREAM_BUF_SIZE (8192)
 
@@ -65,6 +66,7 @@ static volatile int    sndwav_status = SNDDRV_STATUS_NULL;
 static kthread_t      *audio_thread;
 static kthread_attr_t  audio_attr;
 static mutex_t         stream_mutex;
+static snd_resume_t    s_resume;     /* sample-exact pause/resume */
 
 static void *sndwav_thread(void *param);
 static void *wav_file_callback(snd_stream_hnd_t hnd, int req, int *done);
@@ -142,7 +144,10 @@ int adp_wav_init(void)
     /* Allocate the stream and its refill buffer ONCE here, before SFX
      * loading grabs the rest of the AICA channels. The stream is reused
      * for every track played for the rest of the program — adp_wav_create
-     * just opens a new file, never reallocates the stream. */
+     * just opens a new file, never reallocates the stream. The resume
+     * history goes first: it learns the stream's AICA channel by peeking at
+     * the allocation snd_stream_alloc is about to make. */
+    SndResume_Init(&s_resume, STREAM_BUF_SIZE);
     stream.shnd = snd_stream_alloc(wav_file_callback, STREAM_BUF_SIZE);
     if (stream.shnd == SND_STREAM_INVALID) {
         dbglog(DBG_ERROR, "adp_wav_init: snd_stream_alloc failed\n");
@@ -184,7 +189,11 @@ int adp_wav_init(void)
 
 void adp_wav_shutdown(void)
 {
-    /* Real teardown — only call this at program exit. */
+    /* Real teardown — only call this at program exit. Nothing to tear down
+     * before a successful init (stream_mutex does not exist yet), or after a
+     * previous shutdown. The in-game reset can exit from either side of
+     * adp_wav_init(). */
+    if (sndwav_status != SNDDRV_STATUS_READY) return;
     sndwav_status = SNDDRV_STATUS_DONE;
     if (audio_thread) {
         thd_join(audio_thread, NULL);
@@ -299,6 +308,7 @@ wav_stream_hnd_t adp_wav_create(const char *filename, int loop)
     stream.vol         = s_music_vol;
 
     fSeek(stream.wave_file, stream.data_offset, SEEK_SET);
+    SndResume_Reset(&s_resume);
     stream_volume(stream.vol, __func__);
     stream.status = SNDDEC_STATUS_READY;
     mutex_unlock(&stream_mutex);
@@ -308,7 +318,12 @@ wav_stream_hnd_t adp_wav_create(const char *filename, int loop)
 
 void adp_wav_play(void)
 {
-    stream_volume(stream.vol, __func__);
+    /* A pause the audio thread hasn't acted on yet leaves the old stream
+     * running past the pause point; unmuting now would let that be heard
+     * before the thread rewinds. The RESUMING branch sets the volume. */
+    if (!s_resume.pause_marked) {
+        stream_volume(stream.vol, __func__);
+    }
     //printf("adp_wav_play\n");
     if (stream.status == SNDDEC_STATUS_STREAMING) return;
     //printf("adp_wav_play RESUMING\n");
@@ -329,10 +344,17 @@ void adp_wav_play(void)
     } */
 }
 
+/* Must not take stream_mutex: the VMU code calls PauseCD() while holding
+ * io_lock, and the audio thread can hold stream_mutex while it waits for
+ * io_lock inside the refill callback. Note the exact sample playing now; the
+ * audio thread stops the stream and rewinds to it (see snd_resume.h). */
 void adp_wav_pause(void)
 {
     stream_volume(0, __func__);
     if (stream.status == SNDDEC_STATUS_READY || stream.status == SNDDEC_STATUS_PAUSING) return;
+    if (stream.status == SNDDEC_STATUS_STREAMING) {
+        SndResume_MarkPause(&s_resume);
+    }
     stream.status = SNDDEC_STATUS_PAUSING;
 }
 
@@ -388,6 +410,13 @@ static void *sndwav_thread(void *param)
         switch (stream.status) {
         case SNDDEC_STATUS_RESUMING:
             stream_volume(stream.vol, __func__);
+            /* Paused and resumed before this thread saw the PAUSING: the
+             * stream is still running, so finish that pause first. */
+            if (s_resume.pause_marked) {
+                stream_stop(__func__);
+                SndResume_OnStopped(&s_resume);
+            }
+            SndResume_OnStart(&s_resume, 4, (int)stream.channels);
             snd_stream_start_adpcm(stream.shnd, stream.sample_rate,
                                    stream.channels - 1);
             stream_volume(stream.vol, __func__);
@@ -395,10 +424,12 @@ static void *sndwav_thread(void *param)
             break;
         case SNDDEC_STATUS_PAUSING:
             stream_stop(__func__);
+            SndResume_OnStopped(&s_resume);
             stream.status = SNDDEC_STATUS_READY;
             break;
         case SNDDEC_STATUS_STOPPING:
             stream_stop(__func__);
+            SndResume_Reset(&s_resume);
             if (stream.wave_file != NULL)
                 fSeek(stream.wave_file, stream.data_offset, SEEK_SET);
             else
@@ -421,7 +452,18 @@ static void *sndwav_thread(void *param)
 static void *wav_file_callback(snd_stream_hnd_t hnd, int req, int *done)
 {
     (void)hnd;
-    size_t read = fRead(stream.drv_buf, 1, req, stream.wave_file);
+    /* After a pause, the part of the ring that never played goes out again
+     * first; only the remainder comes from the file. */
+    size_t replayed = SndResume_Take(&s_resume, stream.drv_buf, (size_t)req);
+    if (replayed == (size_t)req) {
+        SndResume_Delivered(&s_resume, replayed);
+        *done = req;
+        return stream.drv_buf;
+    }
+    uint8_t *dst = stream.drv_buf + replayed;
+    req -= (int)replayed;
+
+    size_t read = fRead(dst, 1, req, stream.wave_file);
 #if 0
     if (read == -1) {
         //dbglog(DBG_ERROR, "wav_file_callback: fs_read failed (req=%d)\n", req);
@@ -438,7 +480,7 @@ static void *wav_file_callback(snd_stream_hnd_t hnd, int req, int *done)
             return NULL;
         }
         if (stream.loop) {
-            size_t read2 = fRead(stream.drv_buf, 1, req, stream.wave_file);
+            size_t read2 = fRead(dst, 1, req, stream.wave_file);
             if (read2 != req) {
                 //dbglog(DBG_ERROR, "wav_file_callback: loop fs_read failed (req=%d)\n", req);
                 stream_stop(__func__);
@@ -453,6 +495,8 @@ static void *wav_file_callback(snd_stream_hnd_t hnd, int req, int *done)
         }
     }
 
-    *done = req;
+    SndResume_Record(&s_resume, dst, (size_t)req);
+    SndResume_Delivered(&s_resume, replayed + (size_t)req);
+    *done = (int)replayed + req;
     return stream.drv_buf;
 }

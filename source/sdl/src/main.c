@@ -20,6 +20,7 @@
 #include "net_transport.h"
 #include "net/matchmaker.h"
 #include "net/net_interp.h"
+#include "igr.h"
 
 /* Shared keystate from the platform layer */
 extern unsigned char s_keystate[256];
@@ -174,6 +175,10 @@ static int s_cmdUnlock = 0;
 static int s_cmdFullscreen = 0;
 static int s_cmdPort = -1;
 static char s_cmdUsername[MM_MAX_USERNAME];
+
+/* 1 while the demo/replay SFX attenuation applied at race start is in force,
+ * so a reset that leaves the race loop early knows whether to undo it. */
+static int s_demoSfxAttenuated = 0;
 
 extern void UpdateFlyoverCamera(Player *player, CamStateEntry *cam, RenderCamera *outStruct,
                                  int *waypointTable, int param5, int vpIdx);
@@ -823,9 +828,44 @@ def SONICR_DC /* DC splash screen */
      * count globals are set (0x4CE750). Screen return codes must never land
      * here: SCREEN_BACK is 0, so routing one through this would zero the
      * viewport count and skip every per-player init loop downstream. */
-    int mpPlayerCount = 0;
+    /* volatile: modified after the in-game reset's setjmp below, so it must
+     * not be cached in a register across the longjmp. */
+    volatile int mpPlayerCount = 0;
+
+#ifdef SONICR_DC
+    /* In-game reset from the main game lands here (igr_dc.c). The jump
+     * leaves from a frame boundary in whatever screen or race was running;
+     * undo the state those leave behind, as the existing exits to the title
+     * do, then go to the title screen (Sega standard 4.1.4.1) — the same
+     * entry the main menu's "back" uses. Audio was already stopped. */
+    if (setjmp(g_igrJmpBuf) != 0) {
+        extern void SFX_StopAll(void);
+        StopCD();
+        StopAmbientSounds();
+        ReplayVoice_Stop();
+        SFX_StopAll();
+        if (s_demoSfxAttenuated) {
+            g_optSfxVolume = g_optSfxVolumeSave;
+            SetAllSoundVolumes();
+            s_demoSfxAttenuated = 0;
+        }
+        CloseDirectPlaySession();       /* safe when no session is open */
+        g_netSessionActive = 0;
+        g_isNetworkGame = 0;
+        g_isPaused = 0;
+        g_pauseLatch = 0;
+        g_demoMode = DEMO_NONE;
+        g_numHumans = 1;
+        g_numViewports = 1;
+        ApplyViewportGeometry();
+        InitCD();
+        goto title_screen_entry;
+    }
+    IGR_SetJumpReady();
+#endif
 
 title_sequence:
+    IGR_SetTitleLoop(1);
     InitCD();
     ResetInputState();
 
@@ -846,6 +886,7 @@ title_sequence:
     }
 
 title_screen_entry:
+    IGR_SetTitleLoop(1);
     ResetInputState();
     InitTitleScreen();
     DebugLog("RenderMode=RENDER_SOFT\n");
@@ -916,6 +957,7 @@ title_screen_entry:
     g_demoMode = DEMO_NONE;
 
 main_menu_init:
+    IGR_SetTitleLoop(0);        /* START pressed: the main game has begun */
     g_netSessionActive = 0;
     ResetInputState();
     InitOptionStuff();
@@ -1333,6 +1375,7 @@ race_start:
             g_optSfxVolume = g_musicEnabled;
         }
         SetAllSoundVolumes();
+        s_demoSfxAttenuated = 1;
     }
     if (g_demoMode == DEMO_NONE) {
         g_savedDemoMode = g_demoMode;
@@ -1438,6 +1481,7 @@ race_start:
             if (g_demoMode != DEMO_NONE && g_musicEnabled == 1) {
                 g_optSfxVolume = g_optSfxVolumeSave;
                 SetAllSoundVolumes();
+                s_demoSfxAttenuated = 0;
             }
             if (g_demoMode == DEMO_TITLE) {
                 g_difficultyConfig = g_gpDifficultyLevel;
@@ -1767,6 +1811,14 @@ render_frame:
     /* Replay mode -> title screen */
     if (g_demoMode == DEMO_TITLE) {                                             /* 0x4cf857 */
         g_difficultyConfig = g_gpDifficultyLevel; /* 0x8fd444 = 0x6dd834 */
+        /* Undo the demo SFX attenuation applied at loop entry, as the
+         * RACE_RESULT_ENDED exit above does. Without it the SFX stayed
+         * halved after a demo that ended this way. */
+        if (s_demoSfxAttenuated) {
+            g_optSfxVolume = g_optSfxVolumeSave;
+            SetAllSoundVolumes();
+            s_demoSfxAttenuated = 0;
+        }
         g_demoMode = DEMO_NONE;
         /* Demo race may have been 2P split-screen; restore full-screen
          * viewport before bouncing back to title so menus don't render
@@ -1840,6 +1892,7 @@ post_race_non_gp: /* 0x4cf93a */
     if (g_demoMode != DEMO_NONE && g_musicEnabled == 1) { /* 0x4cf980 */
         g_optSfxVolume = g_optSfxVolumeSave; /* 0x4cf992/97: 0x8fd49c = 0x6da2a0 */
         SetAllSoundVolumes();               /* 0x4d0760 */
+        s_demoSfxAttenuated = 0;
     }
 
     /* Post-race 0x004CF9A1 to 0x004CFFFF */

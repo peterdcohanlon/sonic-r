@@ -24,6 +24,7 @@
 #include <dc/sound/stream.h>
 
 #include "sndwav.h"
+#include "snd_resume.h"
 #include "sound/adx.h"   /* shared decoder lives in sdl/src/sound (-I../sdl/src) */
 
 #define STREAM_BUF_SIZE (32768)
@@ -60,6 +61,7 @@ static volatile int    sndwav_status = SNDDRV_STATUS_NULL;
 static kthread_t      *audio_thread;
 static kthread_attr_t  audio_attr;
 static mutex_t         stream_mutex;
+static snd_resume_t    s_resume;     /* sample-exact pause/resume */
 
 /* Guarded stream calls — mirror of sndwav.c. Refuses calls on a dead
  * handle and names the caller, rather than letting KOS assert (debug) or
@@ -127,7 +129,10 @@ int adx_wav_init(void)
     }
 
     /* Allocate the stream + refill buffer ONCE, up front, before SFX grabs the
-     * remaining AICA channels. Reused for every track for the program's life. */
+     * remaining AICA channels. Reused for every track for the program's life.
+     * The resume history goes first: it learns the stream's AICA channel by
+     * peeking at the allocation snd_stream_alloc is about to make. */
+    SndResume_Init(&s_resume, STREAM_BUF_SIZE);
     stream.shnd = snd_stream_alloc(adx_file_callback, STREAM_BUF_SIZE);
     if (stream.shnd == SND_STREAM_INVALID)
         return 0;
@@ -165,6 +170,10 @@ int adx_wav_init(void)
 
 void adx_wav_shutdown(void)
 {
+    /* Nothing to tear down before a successful init (stream_mutex does not
+     * exist yet), or after a previous shutdown. The in-game reset can exit
+     * from either side of wav_init(). */
+    if (sndwav_status != SNDDRV_STATUS_READY) return;
     sndwav_status = SNDDRV_STATUS_DONE;
     if (audio_thread) {
         thd_join(audio_thread, NULL);
@@ -232,6 +241,7 @@ wav_stream_hnd_t adx_wav_create(const char *filename, int loop)
     stream.channels    = stream.dec.channels;
     stream.sample_rate = stream.dec.sampleRate;
     stream.vol         = s_music_vol;
+    SndResume_Reset(&s_resume);
 
     stream_volume(stream.vol, __func__);
     stream.status = SNDDEC_STATUS_READY;
@@ -242,7 +252,10 @@ wav_stream_hnd_t adx_wav_create(const char *filename, int loop)
 
 void adx_wav_play(void)
 {
-    stream_volume(stream.vol, __func__);
+    /* See adp_wav_play: don't unmute a stream still waiting on its pause. */
+    if (!s_resume.pause_marked) {
+        stream_volume(stream.vol, __func__);
+    }
     if (stream.status == SNDDEC_STATUS_STREAMING) return;
     stream.status = SNDDEC_STATUS_RESUMING;
 
@@ -253,10 +266,14 @@ void adx_wav_play(void)
     }
 }
 
+/* Lock-free, for the same reason as adp_wav_pause in sndwav.c. */
 void adx_wav_pause(void)
 {
     stream_volume(0, __func__);
     if (stream.status == SNDDEC_STATUS_READY || stream.status == SNDDEC_STATUS_PAUSING) return;
+    if (stream.status == SNDDEC_STATUS_STREAMING) {
+        SndResume_MarkPause(&s_resume);
+    }
     stream.status = SNDDEC_STATUS_PAUSING;
 }
 
@@ -299,6 +316,13 @@ static void *sndadx_thread(void *param)
         case SNDDEC_STATUS_RESUMING:
             stream_volume(stream.vol, __func__);
             /* PCM mode (not _adpcm): the callback hands over decoded 16-bit. */
+            /* Paused and resumed before this thread saw the PAUSING: the
+             * stream is still running, so finish that pause first. */
+            if (s_resume.pause_marked) {
+                stream_stop(__func__);
+                SndResume_OnStopped(&s_resume);
+            }
+            SndResume_OnStart(&s_resume, 16, (int)stream.channels);
             snd_stream_start(stream.shnd, stream.sample_rate,
                              stream.channels - 1);
             stream_volume(stream.vol, __func__);
@@ -306,10 +330,12 @@ static void *sndadx_thread(void *param)
             break;
         case SNDDEC_STATUS_PAUSING:
             stream_stop(__func__);
+            SndResume_OnStopped(&s_resume);
             stream.status = SNDDEC_STATUS_READY;
             break;
         case SNDDEC_STATUS_STOPPING:
             stream_stop(__func__);
+            SndResume_Reset(&s_resume);
             if (stream.dec_open)
                 Adx_Rewind(&stream.dec);
             stream.status = SNDDEC_STATUS_READY;
@@ -330,14 +356,25 @@ static void *sndadx_thread(void *param)
 static void *adx_file_callback(snd_stream_hnd_t hnd, int req, int *done)
 {
     (void)hnd;
-    size_t got = Adx_Read(&stream.dec, stream.drv_buf, (size_t)req);
+    /* After a pause, the part of the ring that never played goes out again
+     * first; only the remainder is decoded. */
+    size_t replayed = SndResume_Take(&s_resume, stream.drv_buf, (size_t)req);
+    if (replayed == (size_t)req) {
+        SndResume_Delivered(&s_resume, replayed);
+        *done = req;
+        return stream.drv_buf;
+    }
+    uint8_t *dst = stream.drv_buf + replayed;
+    req -= (int)replayed;
+
+    size_t got = Adx_Read(&stream.dec, dst, (size_t)req);
     if (got != (size_t)req) {
         /* End of stream. Rewind and, if looping, re-fill the whole request
          * from the top (mirrors sndwav.c's loop handling — a tiny seam at the
          * wrap, same as the .adp path). */
         Adx_Rewind(&stream.dec);
         if (stream.loop) {
-            size_t got2 = Adx_Read(&stream.dec, stream.drv_buf, (size_t)req);
+            size_t got2 = Adx_Read(&stream.dec, dst, (size_t)req);
             if (got2 != (size_t)req) {
                 stream_stop(__func__);
                 stream.status = SNDDEC_STATUS_READY;
@@ -349,6 +386,8 @@ static void *adx_file_callback(snd_stream_hnd_t hnd, int req, int *done)
             return NULL;
         }
     }
-    *done = req;
+    SndResume_Record(&s_resume, dst, (size_t)req);
+    SndResume_Delivered(&s_resume, replayed + (size_t)req);
+    *done = (int)replayed + req;
     return stream.drv_buf;
 }

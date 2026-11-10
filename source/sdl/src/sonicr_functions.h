@@ -268,10 +268,10 @@ void UpdateFade(void);                                  /* 0x004305D4 */
 int  GetLogicalCDTrack(void);                           /* 0x004D0100 — current medley track: curr while playing, curr+1 once a non-looping track ends */
 void StopCD(void);                                      /* 0x004D0264 — MCI_STOP */
 void UpdateCDPlayback(int trackNum);                    /* 0x004D01AC — same as PlayCD */
+void PauseCD(void);                                     /* hold the music where it is (game pause) */
+void ResumeCD(void);                                    /* carry on from exactly where it was held */
 #ifdef SONICR_DC
-void PauseCD(void);
-void ResumeCD(void);
-int  RunningFromSlowMedia(void);                        /* platform_dc.c — boot-time read-speed probe (CD-R vs ODE/dcload) */
+int  RunningFromSlowMedia(void);                       /* platform_dc.c — boot-time read-speed probe (CD-R vs ODE/dcload) */
 #endif
 void WaitForFrameCap(void);                             /* helper — 30fps cap */
 void Shutdown(void);                                    /* 0x004CA2FC */

@@ -40,6 +40,7 @@ KOS_INIT_FLAGS(INIT_DEFAULT | INIT_NET);
 #include "platform.h"
 #include "pad_bits.h"   /* PAD_LEFT / PAD_UP / ... for the pad poller */
 #include "sonicr_paths.h"   /* PATH_GENERAL_RAW for the slow-media probe */
+#include "igr.h"            /* in-game reset */
 
 /* Filesystem access lock */
 mutex_t io_lock;
@@ -148,6 +149,11 @@ static void dc_show_vmu_warning(void)
      * attached there's nothing to press, so proceed after a short beat. */
     int prevStart = 1;
     for (;;) {
+        /* This screen is part of the title loop, so the soft reset leaves to
+         * the Boot ROM menu from here too. */
+        if (IGR_ComboHeld()) {
+            IGR_ExitToBios();
+        }
         maple_device_t *c = maple_enum_type(0, MAPLE_FUNC_CONTROLLER);
         if (!c) { thd_sleep(1500); break; }
         cont_state_t *st = (cont_state_t *)maple_dev_status(c);
@@ -585,27 +591,21 @@ void platform_pump_events(void)
     }
 #endif
 
-    /* Quit hotkey: L+R+Start on controller 0. The engine has nested
-     * screen-state loops with no single exit point, and nothing in the
-     * codebase actually consumes platform_poll_events' return value, so
-     * exit() directly. KOS's atexit hooks handle teardown. */
+    /* In-game reset (A+B+X+Y+START on any pad, Ctrl+Alt+Del) and the
+     * disc-lid watch. See igr_dc.c. */
+    IGR_Poll();
+
+#if ALLOW_FRAME_DUMP
     maple_device_t *cont = maple_enum_type(0, MAPLE_FUNC_CONTROLLER);
     if (cont) {
         cont_state_t *cs = (cont_state_t *)maple_dev_status(cont);
-        if (cs && (cs->buttons & CONT_START) && (cs->buttons & CONT_A) && (cs->buttons & CONT_B) && (cs->buttons & CONT_X) && (cs->buttons & CONT_Y)) {
-            extern void PauseCD();
-            PauseCD();
-            thd_sleep(250);
-            exit(0);
-        }
-#if ALLOW_FRAME_DUMP
         if (cs && (cs->buttons & CONT_A) && cs->ltrig && cs->rtrig) {
             char fn[256];
             sprintf(fn, "/pc/screen%d.ppm", ssnum++);
             vid_screen_shot(fn);
         }
-#endif
     }
+#endif
 }
 
 /* =====================================================================

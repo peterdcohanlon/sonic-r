@@ -115,6 +115,13 @@ split-screen.
 
 In menus, **A** or **Start** confirms and **B** / **X** backs out.
 
+**Soft reset:** hold **A + B + X + Y** and press **Start** on any controller
+(**Ctrl + Alt + Del** on a Dreamcast keyboard). During play this returns to the title
+screen; on the title screen (or the logos and attract demo) it leaves to the
+Dreamcast menu — or to your ODE's menu, depending on the device. Under
+dcload it returns to dcload. Opening the disc lid on a disc boot also returns
+to the Dreamcast menu.
+
 ### Network lobby (no keyboard needed)
 
 The network screens were built for a keyboard and still show their original

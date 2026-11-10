@@ -33,6 +33,12 @@ static const int s_trackDurationMs[23] = {
 static int   s_logicalTrack = 0;   /* 0x6DA2A4 */
 static DWORD s_trackStartMs = 0;   /* 0x6DA2A8 */
 
+/* Set while the music is held by PauseCD (game paused). The medley clock in
+ * GetLogicalCDTrack is frozen at this instant and shifted forward on resume,
+ * so a pause doesn't count as track time. */
+static int   s_musicPaused = 0;
+static DWORD s_pausedAtMs = 0;
+
 /* Music level, full scale to match dc/src/music_dc.c now that both platforms
  * put the SFX slider on the same even 1/8 steps. DUCKED is what the replay
  * commentary drops it to (see SFX_DuckMusic in sound.c). PlayCD reads
@@ -164,6 +170,9 @@ void PlayCD(int trackNum)
 
     /* Already playing this track — don't restart */
     if (s_currentTrack == trackNum && s_musicTrack != NULL) {
+        if (s_musicPaused) {
+            return;             /* held by PauseCD; ResumeCD carries on */
+        }
         if (Mix_PlayingMusic()) {
             /* Re-baseline the medley clock. A looping track outlives its table
              * entry; the original re-asserted the redbook track at that point,
@@ -225,9 +234,36 @@ void StopCD(void)
     s_currentTrackIsFanfare = 0;
     s_logicalTrack = 0;
     s_trackStartMs = 0;
+    s_musicPaused = 0;
     /* Every path that abandons a replay stops the music, so clearing the duck
      * here covers the exits the race loop's per-frame tick can't reach. */
     SFX_DuckStop();
+}
+
+/**
+ * PauseCD / ResumeCD — hold the music while the game is paused. SDL_mixer
+ * pauses the stream in place, so resume picks up on the same sample.
+ */
+void PauseCD(void)
+{
+    if (s_musicTrack == NULL || s_musicPaused || !Mix_PlayingMusic()) {
+        return;
+    }
+    Mix_PauseMusic();
+    s_musicPaused = 1;
+    s_pausedAtMs = timeGetTime();
+}
+
+void ResumeCD(void)
+{
+    if (!s_musicPaused) {
+        return;
+    }
+    s_musicPaused = 0;
+    s_trackStartMs += timeGetTime() - s_pausedAtMs;    /* pause isn't track time */
+    if (s_musicTrack != NULL) {
+        Mix_ResumeMusic();
+    }
 }
 
 /**
@@ -247,7 +283,9 @@ int GetLogicalCDTrack(void)
         return 0;
     }
 
-    int elapsed = (int)(timeGetTime() - s_trackStartMs);   /* 0x4D0109 */
+    /* Frozen while paused, so the medley doesn't advance during a pause. */
+    DWORD now = s_musicPaused ? s_pausedAtMs : timeGetTime();
+    int elapsed = (int)(now - s_trackStartMs);             /* 0x4D0109 */
     if (elapsed < 0) {
         elapsed = -elapsed;                                /* 0x4D010F: cdq/xor/sub */
     }

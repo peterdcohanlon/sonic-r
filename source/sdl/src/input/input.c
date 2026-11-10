@@ -358,6 +358,7 @@ void UpdatePerPlayerInput(void)
     {
         PlaySoundEffect(0, 0, 0);
         StopAmbientSounds();
+        PauseCD();          /* port: hold the music for the pause */
         g_isPaused = 1;
         g_pauseLatch = 1;
     }
@@ -369,6 +370,7 @@ void UpdatePerPlayerInput(void)
     if (g_isPaused != 0) {
         int pauseResult = RunPauseMenu();
         if (pauseResult == 1) {
+            ResumeCD();     /* port: music carries on from where it was held */
             g_isPaused = 0;
             g_pauseLatch = 1;
         }
